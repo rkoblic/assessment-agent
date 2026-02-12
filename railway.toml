@@ -3,6 +3,6 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "uvicorn src.server:app --host 0.0.0.0 --port $PORT"
+startCommand = "sh -c 'uvicorn src.server:app --host 0.0.0.0 --port ${PORT:-8000}'"
 healthcheckPath = "/domain/standards"
 restartPolicyType = "ON_FAILURE"
