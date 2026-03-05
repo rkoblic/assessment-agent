@@ -9,6 +9,8 @@ Endpoints:
     GET  /domain/standards            — All fractions standards
     GET  /domain/progressions         — Learning progression
     GET  /domain/misconceptions       — All misconceptions
+    GET  /demo                        — Pre-recorded demo assessment
+    GET  /prompt                      — View the full assessment system prompt
 """
 
 from __future__ import annotations
@@ -17,23 +19,46 @@ import asyncio
 import json
 from typing import AsyncGenerator
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 from sse_starlette.sse import EventSourceResponse
 
-from src.agent import AssessmentAgent
+from src.agent import AssessmentAgent, SYSTEM_PROMPT
+from src.config import MAX_TURNS
 from src.db import AssessmentDB
-from src.domain_knowledge import MISCONCEPTIONS, PROGRESSION, STANDARDS
+from src.demo import DEMO_ASSESSMENT
+from src.domain_knowledge import (
+    MISCONCEPTIONS,
+    PROGRESSION,
+    STANDARDS,
+    get_all_misconceptions_summary,
+    get_all_standards_summary,
+    get_progression_summary,
+)
 from src.evidence_report import EvidenceReport
+from src.learner_model import LearnerModel
 from src.synthetic_learner import PERSONAS, SyntheticLearner
 from src.types import AssessmentMode
+
+# ---------------------------------------------------------------------------
+# Rate limiter
+# ---------------------------------------------------------------------------
+
+limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
     title="Assessment Agent API",
     description="AI agent for conversational fractions assessment",
     version="0.1.0",
 )
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -63,12 +88,15 @@ class LearnerResponseRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Assessment endpoints
+# Assessment endpoints (rate-limited — these trigger LLM calls)
 # ---------------------------------------------------------------------------
 
 
 @app.post("/assess")
-async def start_assessment(req: StartAssessmentRequest) -> EventSourceResponse:
+@limiter.limit("5/minute")
+async def start_assessment(
+    request: Request, req: StartAssessmentRequest
+) -> EventSourceResponse:
     """Start an assessment session. Returns an SSE stream of events."""
     mode = AssessmentMode(req.mode)
     agent = AssessmentAgent(mode=mode, persona_name=req.persona_name)
@@ -125,8 +153,9 @@ async def start_assessment(req: StartAssessmentRequest) -> EventSourceResponse:
 
 
 @app.post("/assess/{session_id}/respond")
+@limiter.limit("10/minute")
 async def submit_response(
-    session_id: str, req: LearnerResponseRequest
+    request: Request, session_id: str, req: LearnerResponseRequest
 ) -> EventSourceResponse:
     """Submit a learner response (real learner mode). Returns SSE stream."""
     agent = active_sessions.get(session_id)
@@ -152,13 +181,15 @@ async def submit_response(
 
 
 @app.get("/assessments")
-async def list_assessments() -> list[dict]:
+@limiter.limit("30/minute")
+async def list_assessments(request: Request) -> list[dict]:
     db = AssessmentDB()
     return db.list_assessments()
 
 
 @app.get("/assessments/{assessment_id}")
-async def get_assessment(assessment_id: str) -> dict:
+@limiter.limit("30/minute")
+async def get_assessment(request: Request, assessment_id: str) -> dict:
     db = AssessmentDB()
     result = db.get_assessment(assessment_id)
     if not result:
@@ -167,12 +198,53 @@ async def get_assessment(assessment_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Demo endpoint
+# ---------------------------------------------------------------------------
+
+
+@app.get("/demo")
+@limiter.limit("30/minute")
+async def get_demo(request: Request) -> dict:
+    """Return a pre-recorded demo assessment showing the full event stream.
+
+    This lets users see what an assessment looks like without making any
+    LLM API calls.
+    """
+    return DEMO_ASSESSMENT
+
+
+# ---------------------------------------------------------------------------
+# Prompt endpoint
+# ---------------------------------------------------------------------------
+
+
+@app.get("/prompt")
+@limiter.limit("30/minute")
+async def get_prompt(request: Request) -> PlainTextResponse:
+    """Return the full rendered system prompt used by the assessment agent.
+
+    The prompt is rendered with the actual domain knowledge (standards,
+    misconceptions, progression) and a blank learner model, so viewers
+    can see exactly what the agent sees at the start of an assessment.
+    """
+    rendered = SYSTEM_PROMPT.format(
+        max_turns=MAX_TURNS,
+        standards_summary=get_all_standards_summary(),
+        misconceptions_summary=get_all_misconceptions_summary(),
+        progression_summary=get_progression_summary(),
+        learner_model_summary=LearnerModel().to_summary_string(),
+    )
+    return PlainTextResponse(rendered)
+
+
+# ---------------------------------------------------------------------------
 # Persona & domain endpoints
 # ---------------------------------------------------------------------------
 
 
 @app.get("/personas")
-async def list_personas() -> list[dict]:
+@limiter.limit("30/minute")
+async def list_personas(request: Request) -> list[dict]:
     return [
         {"name": p.name, "grade_level": p.grade_level}
         for p in PERSONAS.values()
@@ -180,7 +252,8 @@ async def list_personas() -> list[dict]:
 
 
 @app.get("/domain/standards")
-async def get_standards() -> list[dict]:
+@limiter.limit("30/minute")
+async def get_standards(request: Request) -> list[dict]:
     return [
         {
             "code": s.code,
@@ -196,7 +269,8 @@ async def get_standards() -> list[dict]:
 
 
 @app.get("/domain/progressions")
-async def get_progressions() -> list[dict]:
+@limiter.limit("30/minute")
+async def get_progressions(request: Request) -> list[dict]:
     return [
         {
             "grade": p.grade,
@@ -210,7 +284,8 @@ async def get_progressions() -> list[dict]:
 
 
 @app.get("/domain/misconceptions")
-async def get_misconceptions() -> list[dict]:
+@limiter.limit("30/minute")
+async def get_misconceptions(request: Request) -> list[dict]:
     return [
         {
             "id": m.id,
